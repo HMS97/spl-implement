@@ -190,8 +190,6 @@ def main():
                 correct += pred.eq(target.view_as(pred)).sum().item()
 
   
-            neptune.log_metric('train_loss', act_epoch, loss.data.cpu().numpy())
-            neptune.log_metric('Train Accuracy', act_epoch ,100. * correct / len(train_loader.dataset))
 
             record_loss = torch.Tensor(record_loss)
 
