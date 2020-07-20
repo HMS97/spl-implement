@@ -8,9 +8,12 @@ from torchvision import datasets, transforms
 from torch.utils.data import TensorDataset, DataLoader, Dataset,SubsetRandomSampler
 from torchvision import models
 import time
+import wandb
 from tqdm import tqdm
+import os 
 import shutil
 from datetime import date
+from torchtoolbox.transform import Cutout
 import argparse
 from torchvision.models import resnet50,alexnet,vgg16
 from torchvision.datasets import ImageFolder
@@ -20,6 +23,7 @@ import numpy as np
 torch.manual_seed(0)
 
 class MyDataset(ImageFolder):
+    # split image into 5 parts each part's partion is 0.6
     def __init__(self, root,transform=None):
         super(MyDataset, self).__init__(root, transform)
         self.indices = range(len(self)) 
@@ -60,7 +64,7 @@ def train(PARAMS, model, criterion, device, train_loader, optimizer, epoch):
     print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} , {:.2f} seconds'.format(
         epoch, batch_idx * len(img), len(train_loader.dataset),
         100. * batch_idx / len(train_loader), loss.item(),time.time() - t0))
- 
+
     return loss_re
 
 def test(PARAMS, model,criterion, device, test_loader,optimizer,epoch):
@@ -86,8 +90,10 @@ def test(PARAMS, model,criterion, device, test_loader,optimizer,epoch):
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-
+   
     acc = 100. * correct / len(test_loader.dataset)
+
+
     return loss_re,acc
 
 def boolean_string(s):
@@ -95,7 +101,48 @@ def boolean_string(s):
         raise ValueError('Not a valid boolean string')
     return s == 'True'
 
+def cal_spldataloader(PARAMS,select_data,train_transform):
+    spltrain_dataset = MyDataset(root = 'train_dataset',transform = train_transform) 
+    remove_index = []
+    for index,i in enumerate(spltrain_dataset.imgs):
+        if( Path(i[0]).stem not in select_data):
+            remove_index.append(index)
+    for index in sorted(remove_index, reverse=True):
+        del spltrain_dataset.imgs[index]
 
+    spltrain_loader = DataLoader(spltrain_dataset,  batch_size=PARAMS['bs'], shuffle=True, num_workers=4, pin_memory = True )
+    return spltrain_loader
+
+
+def select_byloss(PARAMS,train_loader,model,criterion,partion,act_epoch):
+    model.eval()
+    correct = 0
+    record_loss = []
+    file_list = []
+    # calcaulate loss one by one 
+    for batch_idx, (img,target,filename) in enumerate(tqdm(train_loader)):
+        img,  target = img.to(PARAMS['DEVICE']), target.to(PARAMS['DEVICE'])
+        output = model(img)
+
+        for index in range(output.shape[0]):
+            loss = criterion(output[index].unsqueeze(0),target[index].unsqueeze( 0)  )
+            record_loss.append(loss.item())
+            file_list.append(filename[index])
+
+        pred = output.max(1, keepdim=True)[1] # get the index of the max log-probability
+        loss = criterion(output, target )
+        correct += pred.eq(target.view_as(pred)).sum().item()
+
+  
+    record_loss = torch.Tensor(record_loss)
+    part_loss = torch.tensor(sorted(record_loss)).to(PARAMS['DEVICE'])
+    part_loss = part_loss[int(len(part_loss)* partion )-1]
+
+    select_data = []
+    for index,value in enumerate(record_loss <= part_loss):
+        if value:
+            select_data.append(file_list[index])
+    return select_data
 
 def main():
     parser = argparse.ArgumentParser(description='manual to this script')
@@ -107,7 +154,6 @@ def main():
     parser.add_argument('--epoch',type=int, default=10)
 
     args = parser.parse_args()
-   
     PARAMS = {'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                 'bs': args.bs,
                 'epochs':50,
@@ -120,6 +166,7 @@ def main():
                 'fixed':args.fixed,
                 'Augmentation': args.Augmentation,
                 }
+
 
     train_transform = transforms.Compose(
                     [ 
@@ -134,8 +181,6 @@ def main():
                         transforms.Resize((256,256)),
                         transforms.ToTensor(),
                         transforms.Normalize([0.4850, 0.4560, 0.4060], [0.2290, 0.2240, 0.2250])])
-
-
 
 
     train_dataset = MyDataset(root = 'train_dataset',transform = train_transform) 
@@ -157,8 +202,7 @@ def main():
     elif PARAMS['model_name'] == 'alexnet':
         model = models.alexnet(pretrained=True)
         model.classifier[-1] =  nn.Linear(in_features=4096, out_features=num_classes, bias=True)    
-    # model_name = PARAMS['model_name']
-    # model = torch.load(f'saved_models/2020-07-07_{model_name}_baseline.pth')
+    model_name = PARAMS['model_name']
 
     model = model.to(PARAMS['DEVICE'])   
     optimizer = optim.SGD(model.parameters(), lr=PARAMS['lr'], momentum=PARAMS['momentum'])
@@ -168,71 +212,23 @@ def main():
 
     loss_re = train(PARAMS, model,criterion, PARAMS['DEVICE'], train_loader, optimizer, 1)
     act_epoch = 0
-    correct = 0
-    for p in [0.2,0.4,0.6,0.8,1]:
+    ##select data by partion
+    for partion in [0.2,0.4,0.6,0.8,1]:
         for epoch in range(args.epoch):
             act_epoch += 1
-            model.eval()
-            record_loss = []
-            file_list = []
-            # calcaulate loss one by one 
-            for batch_idx, (img,target,filename) in enumerate(tqdm(train_loader)):
-                img,  target = img.to(PARAMS['DEVICE']), target.to(PARAMS['DEVICE'])
-                output = model(img)
+            # select sample by ranked loss
+            select_data = select_byloss(PARAMS,train_loader,model,criterion,partion,act_epoch)
+            # recalculate datalodaer according select data
+            spltrain_loader = cal_spldataloader(PARAMS,select_data,train_transform)
+            # train 10 epochs to expect convergence
+            train(PARAMS, model,criterion, PARAMS['DEVICE'], spltrain_loader,optimizer,10)
 
-                for index in range(output.shape[0]):
-                    loss = criterion(output[index].unsqueeze(0),target[index].unsqueeze( 0)  )
-                    record_loss.append(loss.item())
-                    file_list.append(filename[index])
-
-                pred = output.max(1, keepdim=True)[1] # get the index of the max log-probability
-                loss = criterion(output, target )
-                correct += pred.eq(target.view_as(pred)).sum().item()
-
-  
-
-            record_loss = torch.Tensor(record_loss)
-
-            part_loss = torch.tensor(sorted(record_loss)).to(PARAMS['DEVICE'])
-            part_loss = part_loss[int(len(part_loss)* p )-1]
-
-            select_data = []
-            for index,value in enumerate(record_loss <= part_loss):
-                if value:
-                    select_data.append(file_list[index])
-
-
-
-
-            spltrain_dataset = MyDataset(root = 'train_dataset',transform = train_transform) 
-            remove_index = []
-            for index,i in enumerate(spltrain_dataset.imgs):
-                if( Path(i[0]).stem not in select_data):
-                    remove_index.append(index)
-
-            for index in sorted(remove_index, reverse=True):
-                del spltrain_dataset.imgs[index]
-
-
-            spltrain_loader = DataLoader(spltrain_dataset,  batch_size=PARAMS['bs'], shuffle=True, num_workers=4, pin_memory = True )
-            for c_epoch in range(10):
-                model.train()
-                running_loss = 0
-                for batch_idx, (img,target,filename) in enumerate(tqdm(spltrain_loader)):
-                    img,  target = img.to(PARAMS['DEVICE']), target.to(PARAMS['DEVICE'])
-
-                
-                    optimizer.zero_grad()
-                    output = model(img)
-                    loss = criterion(output, target )
-                    loss.backward()
-                    optimizer.step()
-                    running_loss += loss.item()
-
-
-            _,acc = test(PARAMS, model,criterion, PARAMS['DEVICE'], test_loader,optimizer,act_epoch)
+        _,acc = test(PARAMS, model,criterion, PARAMS['DEVICE'], test_loader,optimizer,act_epoch)
     torch.save(model, 'saved_models/{}_{}_{}_{}_{}spl.pth'.format(date.today(),PARAMS['model_name'],PARAMS['bs'],args.epoch,acc))
 
+      
+
+          
 
 if __name__ == '__main__':
     main()
